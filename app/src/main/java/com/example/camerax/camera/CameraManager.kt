@@ -7,12 +7,13 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager as SystemCameraManager
 import android.hardware.camera2.CaptureRequest
+import android.graphics.Rect
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Range
 import android.view.Surface
-import androidx.camera.view.PreviewView
 import com.example.camerax.model.CameraFacing
 import com.example.camerax.model.Resolution
 
@@ -47,13 +48,18 @@ class CameraManager(private val context: Context) {
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
 
+    private var currentCameraId: String? = null
+    private var currentRequestBuilder: CaptureRequest.Builder? = null
+    private var currentZoom: Float = 1.0f
+    private var currentFacing: CameraFacing = CameraFacing.REAR
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
 
     @SuppressLint("MissingPermission")
     fun startCamera(
-        previewView: PreviewView,
+        previewSurface: Surface?,
         encoderSurface: Surface,
         resolution: Resolution,
         fps: Int,
@@ -66,12 +72,14 @@ class CameraManager(private val context: Context) {
             onCameraError?.invoke("No camera found for facing $facing")
             return
         }
+        currentCameraId = cameraId
+        currentFacing = facing
 
         try {
             cameraSystemManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     cameraDevice = camera
-                    createCaptureSession(camera, encoderSurface, resolution, fps)
+                    createCaptureSession(camera, previewSurface, encoderSurface, resolution, fps)
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
@@ -91,15 +99,67 @@ class CameraManager(private val context: Context) {
         }
     }
 
+    /**
+     * Starts camera preview for in-app viewfinder without encoding pipeline.
+     */
+    @SuppressLint("MissingPermission")
+    fun startPreview(
+        previewSurface: Surface,
+        facing: CameraFacing,
+        zoom: Float = 1.0f
+    ) {
+        releaseCamera()
+        startBackgroundThread()
+
+        val cameraId = getCameraId(facing) ?: run {
+            onCameraError?.invoke("No camera found for facing $facing")
+            return
+        }
+        currentCameraId = cameraId
+        currentFacing = facing
+        currentZoom = zoom
+
+        try {
+            cameraSystemManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    createPreviewSession(camera, previewSurface, zoom)
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    releaseCamera()
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    releaseCamera()
+                }
+            }, backgroundHandler)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error opening preview camera: ${e.message}", e)
+        }
+    }
+
+    fun setZoom(zoom: Float) {
+        currentZoom = zoom
+        val session = captureSession ?: return
+        val builder = currentRequestBuilder ?: return
+        try {
+            applyZoom(builder, zoom)
+            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to apply zoom: ${e.message}")
+        }
+    }
+
     fun switchCamera(
-        previewView: PreviewView,
+        previewSurface: Surface?,
         encoderSurface: Surface,
         resolution: Resolution,
         fps: Int,
         currentFacing: CameraFacing
     ) {
         releaseCamera()
-        startCamera(previewView, encoderSurface, resolution, fps, currentFacing.opposite())
+        startCamera(previewSurface, encoderSurface, resolution, fps, currentFacing.opposite())
     }
 
     fun releaseCamera() {
@@ -108,6 +168,8 @@ class CameraManager(private val context: Context) {
             captureSession = null
             cameraDevice?.close()
             cameraDevice = null
+            currentRequestBuilder = null
+            currentCameraId = null
             stopBackgroundThread()
             onCameraStopped?.invoke()
             Log.i(TAG, "Camera released")
@@ -126,15 +188,22 @@ class CameraManager(private val context: Context) {
 
     private fun createCaptureSession(
         camera: CameraDevice,
+        previewSurface: Surface?,
         encoderSurface: Surface,
         resolution: Resolution,
         fps: Int
     ) {
         try {
-            val surfaces = listOf(encoderSurface)
+            val surfaces = mutableListOf<Surface>(encoderSurface)
+            if (previewSurface != null && previewSurface.isValid) {
+                surfaces.add(previewSurface)
+            }
 
             val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                 addTarget(encoderSurface)
+                if (previewSurface != null && previewSurface.isValid) {
+                    addTarget(previewSurface)
+                }
                 
                 // Real-time camera tuning
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
@@ -170,6 +239,67 @@ class CameraManager(private val context: Context) {
         }
     }
 
+    private fun createPreviewSession(
+        camera: CameraDevice,
+        previewSurface: Surface,
+        zoom: Float
+    ) {
+        try {
+            val surfaces = listOf(previewSurface)
+            val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(previewSurface)
+                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                applyZoom(this, zoom)
+            }
+            currentRequestBuilder = builder
+
+            camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    captureSession = session
+                    try {
+                        session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+                        Log.i(TAG, "Camera2 preview active with zoom $zoom")
+                        onCameraStarted?.invoke()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed repeating request for preview: ${e.message}", e)
+                    }
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Log.e(TAG, "Camera preview session configuration failed")
+                    onCameraError?.invoke("Preview session config failed")
+                }
+            }, backgroundHandler)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create preview session: ${e.message}", e)
+            onCameraError?.invoke("Failed to create preview session: ${e.message}")
+        }
+    }
+
+    private fun applyZoom(builder: CaptureRequest.Builder, zoom: Float) {
+        val cameraId = currentCameraId ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val chars = cameraSystemManager.getCameraCharacteristics(cameraId)
+            val range = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            if (range != null) {
+                val clamped = zoom.coerceIn(range.lower, range.upper)
+                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, clamped)
+                return
+            }
+        }
+        val chars = cameraSystemManager.getCameraCharacteristics(cameraId)
+        val rect = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+        val clampedZoom = maxOf(1.0f, zoom)
+        val cropW = (rect.width() / clampedZoom).toInt()
+        val cropH = (rect.height() / clampedZoom).toInt()
+        val cropX = rect.left + (rect.width() - cropW) / 2
+        val cropY = rect.top + (rect.height() - cropH) / 2
+        builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(cropX, cropY, cropX + cropW, cropY + cropH))
+    }
+
     private fun getCameraId(facing: CameraFacing): String? {
         val targetLens = when (facing) {
             CameraFacing.REAR -> CameraCharacteristics.LENS_FACING_BACK
@@ -195,7 +325,7 @@ class CameraManager(private val context: Context) {
     private fun stopBackgroundThread() {
         backgroundThread?.quitSafely()
         try {
-            backgroundThread?.join()
+            backgroundThread?.join(500)
             backgroundThread = null
             backgroundHandler = null
         } catch (e: Exception) {

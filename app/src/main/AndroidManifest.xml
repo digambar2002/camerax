@@ -14,6 +14,23 @@
     <!-- Keep screen on during streaming -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Foreground service permissions for Android 10+ and Android 14+ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- Floating camera bubble overlay over apps/games -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Notification permission for recording status (Android 13+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Legacy storage write for Android 9 and lower -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
     <!-- Declare camera hardware as required -->
     <uses-feature
         android:name="android.hardware.camera"
@@ -45,6 +62,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Foreground Service for Screen & Audio Recording -->
+        <service
+            android:name=".recording.ScreenRecorderService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection|camera|microphone" />
     </application>
 
 </manifest>
